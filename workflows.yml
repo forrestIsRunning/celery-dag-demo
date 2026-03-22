@@ -1,0 +1,10 @@
+# A → (B | C) → D
+demo.PIPELINE:
+  tasks:
+    - TASK_A
+    - PARALLEL_BC:
+        type: group
+        tasks:
+          - TASK_B
+          - TASK_C
+    - TASK_D
