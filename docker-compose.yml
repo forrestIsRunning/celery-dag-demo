@@ -5,49 +5,49 @@ services:
       - "6379:6379"
 
   model-service:
-    image: python:3.11-slim
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
     working_dir: /model
     volumes:
       - ./model_service:/model
-      - pip-cache:/root/.cache/pip
+      - uv-cache:/root/.cache/uv
     ports:
       - "9000:9000"
     environment:
       - FLASK_APP=app.py
     command: >
-      bash -c "pip install flask &&
+      bash -c "uv pip install --system flask &&
                flask run --host=0.0.0.0 --port=9000"
 
   director-web:
-    image: python:3.11-slim
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
     working_dir: /app
     volumes:
       - .:/app
-      - pip-cache:/root/.cache/pip
+      - uv-cache:/root/.cache/uv
     ports:
       - "8000:8000"
     env_file: .env
     depends_on:
       - redis
     command: >
-      bash -c "pip install -r requirements.txt &&
+      bash -c "uv pip install --system -r pyproject.toml &&
                director db upgrade &&
                director webserver -b 0.0.0.0:8000"
 
   worker:
-    image: python:3.11-slim
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
     working_dir: /app
     volumes:
       - .:/app
-      - pip-cache:/root/.cache/pip
+      - uv-cache:/root/.cache/uv
     env_file: .env
     depends_on:
       - redis
       - director-web
       - model-service
     command: >
-      bash -c "pip install -r requirements.txt &&
+      bash -c "uv pip install --system -r pyproject.toml &&
                director celery worker --loglevel=INFO"
 
 volumes:
-  pip-cache:
+  uv-cache:
