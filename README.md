@@ -302,116 +302,258 @@ A succeeds → B retries 3x and fails, C succeeds → chord dependency failed �
 
 ## Inspecting Task Status & Errors
 
-Every task's status and result (including error details) can be queried after execution. There are three ways to do this:
+The Director REST API exposes workflow and task status at `GET /api/workflows/<workflow_id>`. Here's a real-world example — a `partial_fail` scenario where TASK_B fails while TASK_C succeeds.
 
-### Method 1: Director REST API (Recommended)
+### Step 1: Get the Workflow ID
 
-The Director API returns the full workflow with every task's status, result, and error traceback:
+When you trigger a workflow, the response includes its ID:
 
 ```bash
-# Get workflow detail by ID
-curl -s http://localhost:8000/api/workflows/<workflow_id> | python3 -m json.tool
+curl -s -X POST http://localhost:8000/api/workflows \
+  -H "Content-Type: application/json" \
+  -d '{"project":"demo","name":"PIPELINE","payload":{"raw":"hello world","scenario":"partial_fail"}}'
 ```
 
-**Success task** returns its result data:
 ```json
-{
-  "key": "TASK_A",
-  "status": "success",
-  "result": {
-    "processed": "HELLO WORLD",
-    "length": 11,
-    "model": "text-preprocessor-v1",
-    "retries_used": 0
-  }
-}
+{"id": "53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c", "status": "pending", ...}
 ```
 
-**Failed task** returns the exception and full traceback:
+### Step 2: Query the Workflow Detail
+
+```bash
+curl -s http://localhost:8000/api/workflows/53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c
+```
+
+<details>
+<summary>Full API response (click to expand)</summary>
+
 ```json
 {
-  "key": "TASK_B",
+  "id": "53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c",
+  "fullname": "demo.PIPELINE",
   "status": "error",
-  "result": {
-    "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
-    "traceback": "Traceback (most recent call last):\n  File \".../celery/app/trace.py\", ...\nrequests.exceptions.HTTPError: 500 Server Error: ..."
+  "payload": {"raw": "hello world", "scenario": "partial_fail"},
+  "tasks": [
+    {
+      "id": "3a75c9e1-616f-4859-b6e4-b71f98ecd8b4",
+      "key": "TASK_A",
+      "status": "success",
+      "previous": [],
+      "result": {
+        "processed": "HELLO WORLD",
+        "length": 11,
+        "model": "text-preprocessor-v1",
+        "retries_used": 0
+      }
+    },
+    {
+      "id": "12c5fa43-f070-4004-bf13-75707ba72e1d",
+      "key": "TASK_B",
+      "status": "error",
+      "previous": ["3a75c9e1-616f-4859-b6e4-b71f98ecd8b4"],
+      "result": {
+        "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
+        "traceback": "Traceback (most recent call last):\n  File \".../trace.py\", line 453, in trace_task\n    R = retval = fun(*args, **kwargs)\n  ...\n  File \"/app/tasks/pipeline.py\", line 174, in task_b\n    raise self.retry(exc=exc, countdown=3)\n  ...\nrequests.exceptions.HTTPError: 500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict\n"
+      }
+    },
+    {
+      "id": "cb4435ef-7164-4481-a1b7-a4d858d50d2c",
+      "key": "TASK_C",
+      "status": "success",
+      "previous": ["3a75c9e1-616f-4859-b6e4-b71f98ecd8b4"],
+      "result": {
+        "c_result": "classified by C: positive (0.92)",
+        "confidence": 0.92,
+        "label": "positive",
+        "model": "classifier-v1",
+        "retries_used": 0
+      }
+    },
+    {
+      "id": "fcc1dfc8-2e07-4e35-9d92-71c41e225144",
+      "key": "TASK_D",
+      "status": "pending",
+      "previous": ["12c5fa43-...", "cb4435ef-..."],
+      "result": null
+    }
+  ]
+}
+```
+
+</details>
+
+### Step 3: Diagnose the Problem
+
+Read the response top-down like a diagnostic checklist:
+
+```
+1. Workflow status = "error"
+   → Something failed. Check individual tasks.
+
+2. TASK_A: status = "success"
+   → Preprocessing worked. retries_used = 0, so no hiccups.
+
+3. TASK_B: status = "error"  ← root cause
+   → result.exception = "500 Server Error: INTERNAL SERVER ERROR"
+   → result.traceback shows:
+       pipeline.py:174  raise self.retry(exc=exc, countdown=3)
+       pipeline.py:162  result = call_model(...)
+       pipeline.py:66   resp.raise_for_status()
+   → Conclusion: Model service returned HTTP 500.
+     TASK_B retried 3 times (self.retry with countdown=3),
+     all attempts failed, max_retries exhausted.
+
+4. TASK_C: status = "success"
+   → Classification worked fine (different model endpoint, not affected).
+
+5. TASK_D: status = "pending", result = null
+   → Never executed. TASK_D depends on both B and C (chord).
+     B failed → chord raised ChordError → D was never dispatched.
+```
+
+**Task states in Director**: `pending` → `progress` → `success` | `error` | `canceled`
+
+### Key Fields for Debugging
+
+| Field | What It Tells You |
+|-------|-------------------|
+| `status` | Current state of the task |
+| `result` (success) | The dict your task returned — business data |
+| `result.exception` (error) | The exception message string |
+| `result.traceback` (error) | Full Python traceback — pinpoints the exact line |
+| `previous` | IDs of upstream tasks — trace the dependency chain |
+| `retries_used` | How many retries were consumed before success |
+
+---
+
+## Integrating as an AI Agent Tool
+
+The Director API is a natural fit for an AI agent's tool belt. An agent can trigger workflows, monitor execution, and diagnose failures — all through HTTP.
+
+### Available API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/workflows` | `POST` | Trigger a new workflow |
+| `/api/workflows` | `GET` | List all workflows (with status) |
+| `/api/workflows/<id>` | `GET` | Get workflow detail (tasks, results, errors) |
+
+### Tool Definition (OpenAI-style function calling)
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "trigger_pipeline",
+    "description": "Trigger the text processing pipeline with a given input and scenario",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {"type": "string", "description": "The input text to process"},
+        "scenario": {
+          "type": "string",
+          "enum": ["happy", "flaky", "slow", "down", "partial_fail"],
+          "description": "Failure simulation mode"
+        }
+      },
+      "required": ["text"]
+    }
   }
 }
 ```
 
-**Pending task** (never reached due to upstream failure):
 ```json
 {
-  "key": "TASK_D",
-  "status": "pending",
-  "result": null
+  "type": "function",
+  "function": {
+    "name": "check_workflow",
+    "description": "Check the status and results of a workflow by its ID. Returns task-level status, results, and error tracebacks.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "workflow_id": {"type": "string", "description": "The workflow UUID"}
+      },
+      "required": ["workflow_id"]
+    }
+  }
 }
 ```
 
-The five possible task states in Director: `pending` → `progress` → `success` / `error` / `canceled`.
+### Agent Workflow Example
 
-### Method 2: Redis Result Backend (Direct)
+```
+User: "Process the text 'hello world' and tell me the result"
 
-Each task result is stored in Redis db 1 as a JSON string, keyed by `celery-task-meta-<task_id>`:
+Agent thinking:
+  1. Call trigger_pipeline(text="hello world", scenario="happy")
+     → returns workflow_id = "69766e17-..."
 
-```bash
-# Query directly from Redis
-redis-cli -n 1 GET "celery-task-meta-<task_id>"
+  2. Wait a few seconds, then call check_workflow(workflow_id="69766e17-...")
+     → returns { status: "success", tasks: [...] }
+
+  3. Extract TASK_D result:
+     { "final": "merge complete", "from_b": "embedding by B: dim=8", "from_c": "classified by C: positive (0.92)" }
+
+  4. Respond to user with the merged result.
 ```
 
-```json
-{
-  "status": "FAILURE",
-  "result": {
-    "exc_type": "HTTPError",
-    "exc_message": ["500 Server Error: INTERNAL SERVER ERROR for url: ..."],
-    "exc_module": "requests.exceptions"
-  },
-  "traceback": "Traceback (most recent call last): ...",
-  "task_id": "12c5fa43-f070-4004-bf13-75707ba72e1d",
-  "parent_id": "3a75c9e1-616f-4859-b6e4-b71f98ecd8b4",
-  "group_id": "d2c294fc-51f2-404f-b180-a6f4d3c41e1b",
-  "date_done": "2026-03-22T12:34:23.958757+00:00"
-}
+```
+User: "Run it again but simulate a failure"
+
+Agent thinking:
+  1. Call trigger_pipeline(text="hello world", scenario="down")
+     → returns workflow_id = "abc123-..."
+
+  2. Wait, then call check_workflow(workflow_id="abc123-...")
+     → returns { status: "error", tasks: [TASK_A: error, ...] }
+
+  3. Read TASK_A.result.exception:
+     "500 Server Error: INTERNAL SERVER ERROR"
+
+  4. Respond: "The pipeline failed at TASK_A after 3 retries.
+     The model service returned HTTP 500. TASK_B, C, D were never executed."
 ```
 
-Note: Celery uses uppercase states (`PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) while Director uses lowercase (`pending`, `progress`, `success`, `error`).
-
-### Method 3: Celery Python API (`AsyncResult`)
-
-In application code, use `AsyncResult` to query any task by its ID:
+### Implementation Skeleton (Python)
 
 ```python
-from celery import Celery
+import time
+import requests
 
-app = Celery(broker="redis://localhost:6379/0", backend="redis://localhost:6379/1")
-result = app.AsyncResult("12c5fa43-f070-4004-bf13-75707ba72e1d")
+DIRECTOR_URL = "http://localhost:8000/api"
 
-result.state      # 'SUCCESS' | 'FAILURE' | 'PENDING' | 'RETRY' | 'STARTED'
-result.result     # return value (success) or exception instance (failure)
-result.traceback  # full traceback string (failure only)
-result.date_done  # completion timestamp
+def trigger_pipeline(text: str, scenario: str = "happy") -> str:
+    """Trigger workflow, return workflow_id."""
+    resp = requests.post(f"{DIRECTOR_URL}/workflows", json={
+        "project": "demo",
+        "name": "PIPELINE",
+        "payload": {"raw": text, "scenario": scenario},
+    })
+    return resp.json()["id"]
+
+def check_workflow(workflow_id: str) -> dict:
+    """Poll workflow until terminal state, return full detail."""
+    for _ in range(30):
+        resp = requests.get(f"{DIRECTOR_URL}/workflows/{workflow_id}")
+        data = resp.json()
+        if data["status"] in ("success", "error"):
+            return data
+        time.sleep(1)
+    return data
+
+def diagnose(workflow: dict) -> str:
+    """Turn workflow response into a human-readable diagnosis."""
+    if workflow["status"] == "success":
+        task_d = next(t for t in workflow["tasks"] if t["key"] == "TASK_D")
+        return f"Pipeline succeeded. Result: {task_d['result']}"
+
+    failed = [t for t in workflow["tasks"] if t["status"] == "error"]
+    pending = [t for t in workflow["tasks"] if t["status"] == "pending"]
+    lines = [f"Pipeline failed. {len(failed)} task(s) errored, {len(pending)} never ran."]
+    for t in failed:
+        lines.append(f"  {t['key']}: {t['result']['exception']}")
+    return "\n".join(lines)
 ```
-
-### Where Does the Task ID Come From?
-
-```
-  ┌────────────────────┐     ┌──────────────────────────────────────────┐
-  │  POST /api/workflows│     │  Response:                               │
-  │  (trigger workflow) │────►│  {"id": "69766e17-..."}  ← workflow_id   │
-  └────────────────────┘     └──────────────────────────────────────────┘
-                                       │
-                                       ▼
-  ┌────────────────────────────┐     ┌──────────────────────────────────┐
-  │  GET /api/workflows/<wf_id>│────►│  "tasks": [                      │
-  └────────────────────────────┘     │    {"id":"3a75c...", "key":"A"}, │
-                                      │    {"id":"12c5f...", "key":"B"}, │ ← task_id
-                                      │    ...                          │
-                                      │  ]                              │
-                                      └──────────────────────────────────┘
-```
-
-The workflow ID is returned when you trigger it. Each task's ID is found inside the workflow detail response. You can then use any of the three methods above to inspect individual task status and errors.
 
 ---
 

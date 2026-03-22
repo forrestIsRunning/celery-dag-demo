@@ -285,115 +285,258 @@ A 成功 → B 重试 3 次后失败、C 成功 → chord 中有依赖失败 →
 
 ## 查看任务状态和错误信息
 
-每个任务执行后都可以通过 task_id 查询其状态和结果（包括错误详情）。有三种方式：
+Director REST API 提供了 `GET /api/workflows/<workflow_id>` 端点来查询 workflow 和 task 状态。以下用一个真实的 `partial_fail` 场景（TASK_B 失败、TASK_C 成功）来演示如何定位问题。
 
-### 方式 1：Director REST API（推荐）
+### 第一步：获取 Workflow ID
 
-Director API 返回完整的 workflow 详情，包含每个 task 的状态、返回值和错误堆栈：
+触发 workflow 时，响应中包含其 ID：
 
 ```bash
-# 查 workflow 详情
-curl -s http://localhost:8000/api/workflows/<workflow_id> | python3 -m json.tool
+curl -s -X POST http://localhost:8000/api/workflows \
+  -H "Content-Type: application/json" \
+  -d '{"project":"demo","name":"PIPELINE","payload":{"raw":"hello world","scenario":"partial_fail"}}'
 ```
 
-**成功的 task** 返回业务数据：
 ```json
-{
-  "key": "TASK_A",
-  "status": "success",
-  "result": {
-    "processed": "HELLO WORLD",
-    "length": 11,
-    "model": "text-preprocessor-v1",
-    "retries_used": 0
-  }
-}
+{"id": "53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c", "status": "pending", ...}
 ```
 
-**失败的 task** 返回异常信息和完整 traceback：
+### 第二步：查询 Workflow 详情
+
+```bash
+curl -s http://localhost:8000/api/workflows/53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c
+```
+
+<details>
+<summary>完整 API 响应（点击展开）</summary>
+
 ```json
 {
-  "key": "TASK_B",
+  "id": "53c7faf7-1a4b-4eff-af1e-bc3e993a7c9c",
+  "fullname": "demo.PIPELINE",
   "status": "error",
-  "result": {
-    "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
-    "traceback": "Traceback (most recent call last):\n  File \".../celery/app/trace.py\", ...\nrequests.exceptions.HTTPError: 500 Server Error: ..."
+  "payload": {"raw": "hello world", "scenario": "partial_fail"},
+  "tasks": [
+    {
+      "id": "3a75c9e1-616f-4859-b6e4-b71f98ecd8b4",
+      "key": "TASK_A",
+      "status": "success",
+      "previous": [],
+      "result": {
+        "processed": "HELLO WORLD",
+        "length": 11,
+        "model": "text-preprocessor-v1",
+        "retries_used": 0
+      }
+    },
+    {
+      "id": "12c5fa43-f070-4004-bf13-75707ba72e1d",
+      "key": "TASK_B",
+      "status": "error",
+      "previous": ["3a75c9e1-616f-4859-b6e4-b71f98ecd8b4"],
+      "result": {
+        "exception": "500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict",
+        "traceback": "Traceback (most recent call last):\n  File \".../trace.py\", line 453, in trace_task\n    R = retval = fun(*args, **kwargs)\n  ...\n  File \"/app/tasks/pipeline.py\", line 174, in task_b\n    raise self.retry(exc=exc, countdown=3)\n  ...\nrequests.exceptions.HTTPError: 500 Server Error: INTERNAL SERVER ERROR for url: http://model-service:9000/v1/predict\n"
+      }
+    },
+    {
+      "id": "cb4435ef-7164-4481-a1b7-a4d858d50d2c",
+      "key": "TASK_C",
+      "status": "success",
+      "previous": ["3a75c9e1-616f-4859-b6e4-b71f98ecd8b4"],
+      "result": {
+        "c_result": "classified by C: positive (0.92)",
+        "confidence": 0.92,
+        "label": "positive",
+        "model": "classifier-v1",
+        "retries_used": 0
+      }
+    },
+    {
+      "id": "fcc1dfc8-2e07-4e35-9d92-71c41e225144",
+      "key": "TASK_D",
+      "status": "pending",
+      "previous": ["12c5fa43-...", "cb4435ef-..."],
+      "result": null
+    }
+  ]
+}
+```
+
+</details>
+
+### 第三步：定位问题
+
+从上往下逐个 task 检查，像诊断清单一样：
+
+```
+1. Workflow status = "error"
+   → 有任务失败了，逐个检查。
+
+2. TASK_A: status = "success"
+   → 预处理正常。retries_used = 0，首次就成功了。
+
+3. TASK_B: status = "error"  ← 根因在这里
+   → result.exception = "500 Server Error: INTERNAL SERVER ERROR"
+   → result.traceback 显示:
+       pipeline.py:174  raise self.retry(exc=exc, countdown=3)
+       pipeline.py:162  result = call_model(...)
+       pipeline.py:66   resp.raise_for_status()
+   → 结论: 模型服务返回了 HTTP 500。
+     TASK_B 用 self.retry(countdown=3) 重试了 3 次，
+     全部失败，max_retries 耗尽。
+
+4. TASK_C: status = "success"
+   → 分类正常（调的是不同的模型端点，不受影响）。
+
+5. TASK_D: status = "pending", result = null
+   → 从未执行。TASK_D 依赖 B 和 C（chord 机制）。
+     B 失败 → chord 抛出 ChordError → D 永远不会被调度。
+```
+
+**Director 中任务的状态**: `pending` → `progress` → `success` | `error` | `canceled`
+
+### 调试关键字段
+
+| 字段 | 含义 |
+|------|------|
+| `status` | 任务当前状态 |
+| `result`（成功时） | 你的 task 函数的返回值 — 业务数据 |
+| `result.exception`（失败时） | 异常消息字符串 |
+| `result.traceback`（失败时） | 完整 Python 堆栈 — 精确到代码行号 |
+| `previous` | 上游任务的 ID 列表 — 追踪依赖链 |
+| `retries_used` | 成功前消耗了多少次重试 |
+
+---
+
+## 作为 AI Agent Tool 接入
+
+Director API 天然适合作为 AI Agent 的工具。Agent 可以通过 HTTP 触发 workflow、监控执行、诊断错误。
+
+### 可用 API 端点
+
+| 端点 | 方法 | 用途 |
+|------|------|------|
+| `/api/workflows` | `POST` | 触发新的 workflow |
+| `/api/workflows` | `GET` | 列出所有 workflow（含状态） |
+| `/api/workflows/<id>` | `GET` | 获取 workflow 详情（任务、结果、错误） |
+
+### Tool 定义（OpenAI function calling 格式）
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "trigger_pipeline",
+    "description": "触发文本处理流水线",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {"type": "string", "description": "输入文本"},
+        "scenario": {
+          "type": "string",
+          "enum": ["happy", "flaky", "slow", "down", "partial_fail"],
+          "description": "失败模拟模式"
+        }
+      },
+      "required": ["text"]
+    }
   }
 }
 ```
 
-**未执行的 task**（因上游失败而未到达）：
 ```json
 {
-  "key": "TASK_D",
-  "status": "pending",
-  "result": null
+  "type": "function",
+  "function": {
+    "name": "check_workflow",
+    "description": "按 ID 查询 workflow 的状态和结果，返回每个 task 的状态、返回值和错误堆栈",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "workflow_id": {"type": "string", "description": "Workflow UUID"}
+      },
+      "required": ["workflow_id"]
+    }
+  }
 }
 ```
 
-Director 中任务的五种状态：`pending` → `progress` → `success` / `error` / `canceled`。
+### Agent 调用示例
 
-### 方式 2：直接查 Redis Result Backend
+```
+用户: "处理文本 'hello world'，告诉我结果"
 
-每个 task 的结果以 JSON 存储在 Redis db 1 中，key 为 `celery-task-meta-<task_id>`：
+Agent 思考:
+  1. 调用 trigger_pipeline(text="hello world", scenario="happy")
+     → 返回 workflow_id = "69766e17-..."
 
-```bash
-redis-cli -n 1 GET "celery-task-meta-<task_id>"
+  2. 等几秒后调用 check_workflow(workflow_id="69766e17-...")
+     → 返回 { status: "success", tasks: [...] }
+
+  3. 提取 TASK_D 的结果:
+     { "final": "merge complete", "from_b": "embedding by B: dim=8", "from_c": "classified by C: positive (0.92)" }
+
+  4. 回复用户: "处理完成。embedding 维度为 8，分类结果为 positive（置信度 0.92）。"
 ```
 
-```json
-{
-  "status": "FAILURE",
-  "result": {
-    "exc_type": "HTTPError",
-    "exc_message": ["500 Server Error: INTERNAL SERVER ERROR for url: ..."],
-    "exc_module": "requests.exceptions"
-  },
-  "traceback": "Traceback (most recent call last): ...",
-  "task_id": "12c5fa43-...",
-  "parent_id": "3a75c9e1-...",
-  "group_id": "d2c294fc-...",
-  "date_done": "2026-03-22T12:34:23.958757+00:00"
-}
+```
+用户: "再跑一次，模拟故障"
+
+Agent 思考:
+  1. 调用 trigger_pipeline(text="hello world", scenario="down")
+     → 返回 workflow_id = "abc123-..."
+
+  2. 等待后调用 check_workflow(workflow_id="abc123-...")
+     → 返回 { status: "error", tasks: [TASK_A: error, ...] }
+
+  3. 读取 TASK_A.result.exception:
+     "500 Server Error: INTERNAL SERVER ERROR"
+
+  4. 回复: "流水线在 TASK_A 阶段失败，重试 3 次后仍然报错。
+     模型服务返回了 HTTP 500。TASK_B、C、D 均未执行。"
 ```
 
-注意：Celery 原生使用大写状态（`PENDING`、`STARTED`、`SUCCESS`、`FAILURE`、`RETRY`），Director 使用小写（`pending`、`progress`、`success`、`error`）。
-
-### 方式 3：Celery Python API（`AsyncResult`）
-
-在代码中通过 `AsyncResult` 按 task_id 查询：
+### 实现骨架（Python）
 
 ```python
-from celery import Celery
+import time
+import requests
 
-app = Celery(broker="redis://localhost:6379/0", backend="redis://localhost:6379/1")
-result = app.AsyncResult("12c5fa43-f070-4004-bf13-75707ba72e1d")
+DIRECTOR_URL = "http://localhost:8000/api"
 
-result.state      # 'SUCCESS' | 'FAILURE' | 'PENDING' | 'RETRY' | 'STARTED'
-result.result     # 返回值（成功时）或异常实例（失败时）
-result.traceback  # 完整 traceback 字符串（仅失败时有值）
-result.date_done  # 完成时间戳
+def trigger_pipeline(text: str, scenario: str = "happy") -> str:
+    """触发 workflow，返回 workflow_id。"""
+    resp = requests.post(f"{DIRECTOR_URL}/workflows", json={
+        "project": "demo",
+        "name": "PIPELINE",
+        "payload": {"raw": text, "scenario": scenario},
+    })
+    return resp.json()["id"]
+
+def check_workflow(workflow_id: str) -> dict:
+    """轮询 workflow 直到终态，返回完整详情。"""
+    for _ in range(30):
+        resp = requests.get(f"{DIRECTOR_URL}/workflows/{workflow_id}")
+        data = resp.json()
+        if data["status"] in ("success", "error"):
+            return data
+        time.sleep(1)
+    return data
+
+def diagnose(workflow: dict) -> str:
+    """把 workflow 响应转为可读的诊断报告。"""
+    if workflow["status"] == "success":
+        task_d = next(t for t in workflow["tasks"] if t["key"] == "TASK_D")
+        return f"流水线成功。结果: {task_d['result']}"
+
+    failed = [t for t in workflow["tasks"] if t["status"] == "error"]
+    pending = [t for t in workflow["tasks"] if t["status"] == "pending"]
+    lines = [f"流水线失败。{len(failed)} 个任务出错，{len(pending)} 个未执行。"]
+    for t in failed:
+        lines.append(f"  {t['key']}: {t['result']['exception']}")
+    return "\n".join(lines)
 ```
-
-### task_id 从哪来？
-
-```
-  ┌────────────────────┐     ┌───────────────────────────────────────┐
-  │  POST /api/workflows│     │  Response:                            │
-  │  （触发 workflow）   │────►│  {"id": "69766e17-..."}  ← workflow_id│
-  └────────────────────┘     └───────────────────────────────────────┘
-                                       │
-                                       ▼
-  ┌────────────────────────────┐     ┌──────────────────────────────────┐
-  │  GET /api/workflows/<wf_id>│────►│  "tasks": [                      │
-  └────────────────────────────┘     │    {"id":"3a75c...", "key":"A"}, │
-                                      │    {"id":"12c5f...", "key":"B"}, │ ← task_id
-                                      │    ...                          │
-                                      │  ]                              │
-                                      └──────────────────────────────────┘
-```
-
-触发 workflow 时返回 workflow_id，查 workflow 详情时返回每个 task 的 id。然后可以用上述三种方式查单个 task 的状态和错误信息。
 
 ---
 
